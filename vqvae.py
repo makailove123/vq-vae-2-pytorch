@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 
 import distributed as dist_fn
+from vqvae_config import VqvaeConfig
 
 
 # Copyright 2018 The Sonnet Authors. All Rights Reserved.
@@ -99,7 +100,18 @@ class Encoder(nn.Module):
     def __init__(self, in_channel, channel, n_res_block, n_res_channel, stride):
         super().__init__()
 
-        if stride == 4:
+        if stride == 8:
+            blocks = [
+                nn.Conv2d(in_channel, channel // 4, 4, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channel // 4, channel // 2, 4, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channel // 2, channel, 4, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channel, channel, 3, padding=1),
+            ]
+
+        elif stride == 4:
             blocks = [
                 nn.Conv2d(in_channel, channel // 2, 4, stride=2, padding=1),
                 nn.ReLU(inplace=True),
@@ -139,7 +151,20 @@ class Decoder(nn.Module):
 
         blocks.append(nn.ReLU(inplace=True))
 
-        if stride == 4:
+        if stride == 8:
+            blocks.extend(
+                [
+                    nn.ConvTranspose2d(channel, channel // 4, 4, stride=2, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose2d(channel // 4, channel // 2, 4, stride=2, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose2d(
+                        channel // 2, out_channel, 4, stride=2, padding=1
+                    ),
+                ]
+            )
+
+        elif stride == 4:
             blocks.extend(
                 [
                     nn.ConvTranspose2d(channel, channel // 2, 4, stride=2, padding=1),
@@ -162,19 +187,20 @@ class Decoder(nn.Module):
 
 
 class VQVAE(nn.Module):
-    def __init__(
-        self,
-        in_channel=3,
-        channel=128,
-        n_res_block=2,
-        n_res_channel=32,
-        embed_dim=64,
-        n_embed=512,
-        decay=0.99,
-    ):
+    def __init__(self, config: VqvaeConfig):
         super().__init__()
 
-        self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, stride=4)
+        self.config = config
+        in_channel = config.in_channel
+        channel = config.channel
+        n_res_block = config.n_res_block
+        n_res_channel = config.n_res_channel
+        embed_dim = config.embed_dim
+        n_embed = config.n_embed
+        decay = config.decay
+        bottom_stride = config.bottom_stride
+
+        self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, stride=bottom_stride)
         self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, stride=2)
         self.quantize_conv_t = nn.Conv2d(channel, embed_dim, 1)
         self.quantize_t = Quantize(embed_dim, n_embed)
@@ -183,16 +209,14 @@ class VQVAE(nn.Module):
         )
         self.quantize_conv_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
         self.quantize_b = Quantize(embed_dim, n_embed)
-        self.upsample_t = nn.ConvTranspose2d(
-            embed_dim, embed_dim, 4, stride=2, padding=1
-        )
+        self.upsample_t = nn.ConvTranspose2d(embed_dim, embed_dim, 4, stride=2, padding=1)
         self.dec = Decoder(
             embed_dim + embed_dim,
             in_channel,
             channel,
             n_res_block,
             n_res_channel,
-            stride=4,
+            stride=bottom_stride,
         )
 
     def forward(self, input):
@@ -204,19 +228,28 @@ class VQVAE(nn.Module):
     def encode(self, input):
         enc_b = self.enc_b(input)
         enc_t = self.enc_t(enc_b)
+        #print(1, "enc_b", enc_b.shape, "enc_t", enc_t.shape)
 
         quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1)
+        #print(2, "quant_t", quant_t.shape)
         quant_t, diff_t, id_t = self.quantize_t(quant_t)
+        #print(3, "quant_t", quant_t.shape, "diff_t", diff_t.shape, "id_t", id_t.shape)
         quant_t = quant_t.permute(0, 3, 1, 2)
         diff_t = diff_t.unsqueeze(0)
 
+        #print(4, "quant_t", quant_t.shape, "diff_t", diff_t.shape, "id_t", id_t.shape)
         dec_t = self.dec_t(quant_t)
+        #print("4-1", "dec_t", dec_t.shape)
         enc_b = torch.cat([dec_t, enc_b], 1)
+        #print(5, "dec_t", dec_t.shape, "enc_b", enc_b.shape)
 
         quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1)
+        #print(6, "quant_b", quant_b.shape)
         quant_b, diff_b, id_b = self.quantize_b(quant_b)
+        #print(7, "quant_b", quant_b.shape, "diff_b", diff_b.shape, "id_b", id_b.shape)
         quant_b = quant_b.permute(0, 3, 1, 2)
         diff_b = diff_b.unsqueeze(0)
+        #print(8, "quant_b", quant_b.shape, "diff_b", diff_b.shape, "id_b", id_b.shape)
 
         return quant_t, quant_b, diff_t + diff_b, id_t, id_b
 
