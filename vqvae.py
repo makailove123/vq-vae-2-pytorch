@@ -269,3 +269,60 @@ class VQVAE(nn.Module):
         dec = self.decode(quant_t, quant_b)
 
         return dec
+
+
+class ResBlock2(nn.Module):
+    def __init__(self, in_channel, channel):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channel, channel, 3, padding=1),
+            nn.BatchNorm2d(channel),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel, in_channel, 1),
+            nn.BatchNorm2d(in_channel),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, input):
+        out = self.conv(input)
+        out += input
+
+        return out
+
+
+class EncoderBottom(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inplanes = 64
+        blocks = [
+            nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(self.inplanes),
+            nn.ReLU(inplace=True),
+            ResBlock2(self.inplanes, self.inplanes),
+            ResBlock2(self.inplanes, self.inplanes),
+            nn.Conv2d(self.inplanes, self.inplanes * 2, 3, stride=2, padding=1),
+            nn.BatchNorm2d(self.inplanes),
+            nn.ReLU(inplace=True),
+            ResBlock2(self.inplanes * 2, self.inplanes * 2),
+            ResBlock2(self.inplanes * 2, self.inplanes * 2),
+            nn.Conv2d(self.inplanes * 2, self.inplanes * 4, 3, stride=2, padding=1),
+            nn.BatchNorm2d(self.inplanes * 4),
+            nn.ReLU(inplace=True),
+            ResBlock2(self.inplanes * 4, self.inplanes * 4),
+            ResBlock2(self.inplanes * 4, self.inplanes * 4),
+            nn.Conv2d(self.inplanes * 4, self.inplanes * 8, 3, stride=2, padding=1),
+            nn.BatchNorm2d(self.inplanes * 8),
+            nn.ReLU(inplace=True),
+        ]
+        self.blocks = nn.Sequential(*blocks)
+
+    def forward(self, input):
+        return self.blocks(input)
+    
+
+class EncoderTop(nn.Module):
+    def __init__(self):
+        super(EncoderTop, self).__init__()
+
+

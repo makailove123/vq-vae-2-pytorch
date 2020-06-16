@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 import re
 import shutil
+import hashlib
+import urllib
 
 import torch
 from torch import nn, optim
@@ -38,6 +40,17 @@ MODEL_SAVE_NAME = "pytorch_model.bin"
 OPTIMIZER_SAVE_NAME = "optimizer.pt"
 SCHEDULER_SAVE_NAME = "scheduler.pt"
 CONFIG_SAVE_NAME = "config.json"
+
+try:
+    from apex import amp
+
+    _has_apex = True
+except ImportError:
+    _has_apex = False
+
+
+def is_apex_available():
+    return _has_apex
 
 
 def parse_checkpoint_step(ckpt_path: str) -> Optional[int]:
@@ -145,7 +158,11 @@ class Trainer:
             recon_loss = criterion(out, img)
             latent_loss = latent_loss.mean()
             loss = recon_loss + latent_loss_weight * latent_loss
-            loss.backward()
+            if self.args.fp16:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backword()
+            else:
+                loss.backward()
 
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -230,7 +247,10 @@ class ImageDataset(IterableDataset):
         worker_id = worker_info.id
         pic_size = int(math.ceil(len(self.file_list) / num_workers))
         for f in self.file_list[pic_size * worker_id: pic_size * worker_id + pic_size]:
-            img = default_loader(f)
+            try:
+                img = default_loader(f)
+            except:
+                continue
             yield self.transform(img)
 
 
@@ -286,14 +306,6 @@ def main(args, file_list):
         model.load_state_dict(
             torch.load(os.path.join(recent_ckpt, MODEL_SAVE_NAME), map_location=device))
         print("load ckpt {}".format(recent_ckpt), file=sys.stderr, flush=True)
-
-    if args.distributed:
-        model = nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[dist.get_local_rank()],
-            output_device=dist.get_local_rank(),
-        )
-
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = None
     if args.sched == "cycle":
@@ -312,8 +324,38 @@ def main(args, file_list):
         if os.path.isfile(os.path.join(recent_ckpt, SCHEDULER_SAVE_NAME)):
             scheduler.load_state_dict(torch.load(os.path.join(recent_ckpt, SCHEDULER_SAVE_NAME)))
 
+    if args.fp16:
+        if not is_apex_available():
+            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+
+    if args.distributed:
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[dist.get_local_rank()],
+            output_device=dist.get_local_rank(),
+        )
+
     trainer = Trainer(args, loader, model_config, model, optimizer, scheduler, device, trained_steps)
     trainer.train()
+
+
+def get_key_path(root_dir: str, key: str) -> str:
+    md5 = hashlib.md5(key.encode("utf-8")).hexdigest()
+    filename = urllib.parse.quote_plus(key)
+    return os.path.join(root_dir, md5[:3], md5[3:6], filename)
+
+
+def load_img_path_list(root_dir: str, list_file: str) -> List[str]:
+    ret = []
+    linecnt = 0
+    for line in open(list_file):
+        linecnt += 1
+        if linecnt % 1000000 == 0:
+            print("load {} imgs".format(linecnt), file=sys.stderr, flush=True)
+        img_path = get_key_path(root_dir, line.strip())
+        ret.append(img_path)
+    return ret
 
 
 if __name__ == "__main__":
@@ -339,6 +381,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_total_limit", type=int, default=5)
+    parser.add_argument("--fp16", type=bool, default=False)
+    parser.add_argument("--fp16_opt_level", type=str, default="01")
     parser.add_argument("path", type=str)
 
     args = parser.parse_args()
@@ -347,16 +391,8 @@ if __name__ == "__main__":
     os.makedirs(args.eval_path, exist_ok=True)
 
     print(args, file=sys.stderr, flush=True)
-    file_list = []
-    file_cnt = 0
-    for root_dir, sub_dirs, files in os.walk(args.path):
-        for f in files:
-            file_cnt += 1
-            if file_cnt % 100000 == 0:
-                print("find {} files".format(file_cnt), file=sys.stderr, flush=True)
-            file_list.append(os.path.join(root_dir, f))
-        if file_cnt >= 1000000:
-            break
+    file_list = load_img_path_list("/mnt2/makai/imgs", "/mnt2/makai/img_set_from_kept_nids")
+    print("totoal imgs {}".format(len(file_list)), file=sys.stderr, flush=True)
 
     proc_num = 1
     if args.device == "cuda":
