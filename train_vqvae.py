@@ -34,7 +34,6 @@ from vqvae_config import VqvaeConfig
 
 logger = logging.getLogger(__name__)
 
-
 PREFIX_CHECKPOINT_DIR = "checkpoint"
 MODEL_SAVE_NAME = "pytorch_model.bin"
 OPTIMIZER_SAVE_NAME = "optimizer.pt"
@@ -116,7 +115,8 @@ class Trainer:
         number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - self.args.save_total_limit)
         checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
         for checkpoint in checkpoints_to_be_deleted:
-            print("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint), file=sys.stderr, flush=True)
+            print("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint), file=sys.stderr,
+                  flush=True)
             shutil.rmtree(checkpoint)
 
     def save_checkpoint(self):
@@ -154,7 +154,8 @@ class Trainer:
             self.model.zero_grad()
             img = img.to(self.device)
 
-            out, latent_loss = self.model(img)
+            outputs = self.model(img)
+            out, latent_loss = outputs[:2]
             recon_loss = criterion(out, img)
             latent_loss = latent_loss.mean()
             loss = recon_loss + latent_loss_weight * latent_loss
@@ -164,9 +165,9 @@ class Trainer:
             else:
                 loss.backward()
 
+            self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
-            self.optimizer.step()
 
             part_mse_sum = recon_loss.item() * img.shape[0]
             part_mse_n = img.shape[0]
@@ -196,7 +197,7 @@ class Trainer:
                 self.model.eval()
                 sample = img[:sample_size]
                 with torch.no_grad():
-                    out, _ = self.model(sample)
+                    out = self.model(sample)[0]
                 utils.save_image(
                     torch.cat([sample, out], 0),
                     f"{self.args.eval_path}/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}.png",
@@ -212,61 +213,96 @@ class Trainer:
         self.save_checkpoint()
 
 
+def build_transform(size):
+    return transforms.Compose(
+        [
+            transforms.Resize(size),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ]
+    )
+
+
 class ImageDataset(IterableDataset):
     def __init__(
             self,
-            file_list: List[str],
+            img_root_path,
+            img_keys_path,
             transform,
             batch_size,
             dist_mode: bool = False,
-            rank_seed: Optional[int] = None
+            rank_seed: Optional[int] = None,
+            with_key: bool = False
     ):
-        self.file_list = file_list
+        self.img_root_path = img_root_path
+        self.img_keys_path = img_keys_path
         self.transform = transform
         self.batch_size = batch_size
         if rank_seed is not None:
             self.rand = random.Random(rank_seed)
         else:
             self.rand = random.Random(time.time())
-        self.rand.shuffle(self.file_list)
+
+        self.img_keys_file_list = [
+            os.path.join(self.img_keys_path, f) for f in
+            os.listdir(self.img_keys_path) if not f.startswith('.')
+        ]
+
+        self.rand.shuffle(self.img_keys_file_list)
         self.rank = -1
         if dist_mode:
-            rank_pic_size = int(math.ceil(len(self.file_list) / dist.get_world_size()))
-            self.file_list = self.file_list[rank_pic_size * dist.get_rank():
-                                            rank_pic_size * (dist.get_rank() + 1)]
+            rank_pic_size = int(math.ceil(len(self.img_keys_file_list) / dist.get_world_size()))
+            self.img_keys_file_list = self.img_keys_file_list[rank_pic_size * dist.get_rank():
+                                                              rank_pic_size * (dist.get_rank() + 1)]
             self.rank = dist.get_rank()
-        self.num_examples = len(self.file_list)
+        self.num_examples = max((sum((1 for _ in open(f))) for f in self.img_keys_file_list[:10])) \
+                            * len(self.img_keys_file_list)
         self.num_itertions = int(math.ceil(self.num_examples / batch_size))
+        self.with_key = with_key
 
     def __len__(self):
         return self.num_examples
 
     def __iter__(self):
+        self.rand.shuffle(self.img_keys_file_list)
         worker_info = torch.utils.data.get_worker_info()
-        num_workers = worker_info.num_workers
-        worker_id = worker_info.id
-        pic_size = int(math.ceil(len(self.file_list) / num_workers))
-        for f in self.file_list[pic_size * worker_id: pic_size * worker_id + pic_size]:
-            try:
-                img = default_loader(f)
-            except:
-                continue
-            yield self.transform(img)
+        if worker_info is not None:
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+        else:
+            num_workers = 1
+            worker_id = 0
+        pic_size = int(math.ceil(len(self.img_keys_file_list) / num_workers))
+        for f in self.img_keys_file_list[pic_size * worker_id: pic_size * worker_id + pic_size]:
+            for line in open(f):
+                img_key = line.strip()
+                img_path = get_key_path(self.img_root_path, img_key)
+                try:
+                    img = default_loader(img_path)
+                except:
+                    continue
+                if self.with_key:
+                    yield img_key, self.transform(img)
+                else:
+                    yield self.transform(img)
 
 
 class IterDataLoader(DataLoader):
-    def __init__(self, dataset, batch_size=1, num_workers=0):
+    def __init__(self, dataset, batch_size=1, num_workers=0, collate_fn=None, pin_memory=False):
         super(IterDataLoader, self).__init__(
             dataset=dataset,
             batch_size=batch_size,
-            num_workers=num_workers
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory
         )
 
     def __len__(self):
         return int(math.ceil(len(self.dataset) / self.batch_size))
 
 
-def main(args, file_list):
+def main(args):
     model_config_json = open(args.config_path).read()
     print("ModelConfig:", model_config_json, file=sys.stderr, flush=True)
     model_config = VqvaeConfig.from_json(model_config_json)
@@ -281,22 +317,16 @@ def main(args, file_list):
         else:
             device = torch.device("cuda")
 
-    transform = transforms.Compose(
-        [
-            transforms.Resize(args.size),
-            transforms.CenterCrop(args.size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ]
-    )
+    transform = build_transform(args.size)
 
-    dataset = ImageDataset(file_list, transform, args.batch_size, args.distributed, int(time.time()))
+    dataset = ImageDataset(args.img_root_path, args.img_keys_path, transform, args.batch_size, args.distributed,
+                           int(time.time()))
     local_batch_size = args.batch_size
     if args.distributed:
         local_batch_size = local_batch_size // dist.get_world_size()
     print("local_batch_size={}".format(local_batch_size), file=sys.stderr, flush=True)
     loader = IterDataLoader(
-        dataset, batch_size=local_batch_size, num_workers=1
+        dataset, batch_size=local_batch_size, num_workers=1, pin_memory=True
     )
 
     model = VQVAE(model_config).to(device)
@@ -309,12 +339,20 @@ def main(args, file_list):
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = None
     if args.sched == "cycle":
+        '''
         scheduler = CycleScheduler(
             optimizer,
             args.lr,
             n_iter=len(loader) * args.epochs,
             momentum=None,
             warmup_proportion=0.05,
+        )
+        '''
+        scheduler = optim.lr_scheduler.CyclicLR(
+            optimizer=optimizer,
+            base_lr=args.lr / 10,
+            max_lr=args.lr,
+            cycle_momentum=False
         )
     if recent_ckpt is not None:
         if os.path.isfile(os.path.join(recent_ckpt, OPTIMIZER_SAVE_NAME)):
@@ -355,6 +393,8 @@ def load_img_path_list(root_dir: str, list_file: str) -> List[str]:
             print("load {} imgs".format(linecnt), file=sys.stderr, flush=True)
         img_path = get_key_path(root_dir, line.strip())
         ret.append(img_path)
+        if len(ret) > 1000000:
+            break
     return ret
 
 
@@ -362,9 +402,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     port = (
-        2 ** 15
-        + 2 ** 14
-        + hash(os.getuid() if sys.platform != "win32" else 1) % 2 ** 14
+            2 ** 15
+            + 2 ** 14
+            + hash(os.getuid() if sys.platform != "win32" else 1) % 2 ** 14
     )
     parser.add_argument("--dist_url", default=f"tcp://127.0.0.1:{port}")
 
@@ -383,19 +423,21 @@ if __name__ == "__main__":
     parser.add_argument("--save_total_limit", type=int, default=5)
     parser.add_argument("--fp16", type=bool, default=False)
     parser.add_argument("--fp16_opt_level", type=str, default="01")
-    parser.add_argument("path", type=str)
+    parser.add_argument("--img_keys_path", type=str, default=None)
+    parser.add_argument("--img_root_path", type=str, default=None)
 
     args = parser.parse_args()
+
+    assert os.path.isdir(args.img_keys_path)
+    assert os.path.isdir(args.img_root_path)
 
     os.makedirs(args.output_path, exist_ok=True)
     os.makedirs(args.eval_path, exist_ok=True)
 
     print(args, file=sys.stderr, flush=True)
-    file_list = load_img_path_list("/mnt2/makai/imgs", "/mnt2/makai/img_set_from_kept_nids")
-    print("totoal imgs {}".format(len(file_list)), file=sys.stderr, flush=True)
 
     proc_num = 1
     if args.device == "cuda":
         proc_num = torch.cuda.device_count()
     print("proc_num={}".format(proc_num), file=sys.stderr, flush=True)
-    dist.launch(main, proc_num, 1, 0, args.dist_url, args=(args, file_list))
+    dist.launch(main, proc_num, 1, 0, args.dist_url, args=(args,))

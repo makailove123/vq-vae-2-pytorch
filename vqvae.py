@@ -220,10 +220,10 @@ class VQVAE(nn.Module):
         )
 
     def forward(self, input):
-        quant_t, quant_b, diff, _, _ = self.encode(input)
+        quant_t, quant_b, diff, id_t, id_b = self.encode(input)
         dec = self.decode(quant_t, quant_b)
 
-        return dec, diff
+        return dec, diff, id_t, id_b
 
     def encode(self, input):
         enc_b = self.enc_b(input)
@@ -289,6 +289,10 @@ class ResBlock2(nn.Module):
         out += input
 
         return out
+
+
+def build_encode_layer(in_channel, out_channel):
+    pass
 
 
 class EncoderBottom(nn.Module):
