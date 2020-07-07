@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 
 import distributed as dist_fn
-from vqvae_config import VqvaeConfig
+from vqvae_config import VqvaeConfig, VqVaeConfig2
 
 
 # Copyright 2018 The Sonnet Authors. All Rights Reserved.
@@ -271,62 +271,190 @@ class VQVAE(nn.Module):
         return dec
 
 
+def conv3x3(in_channels, out_channels, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+
+def conv1x1(in_channels, out_channels, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False)
+
+
+def transconv2x2(in_channels, out_channels):
+    """upsampling by double"""
+    return nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+
+
 class ResBlock2(nn.Module):
-    def __init__(self, in_channel, channel):
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
+        self.conv1 = conv3x3(in_channels, out_channels, stride)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(out_channels, out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
 
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channel, channel, 3, padding=1),
-            nn.BatchNorm2d(channel),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channel, in_channel, 1),
-            nn.BatchNorm2d(in_channel),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, input):
-        out = self.conv(input)
-        out += input
-
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += identity
+        out = self.relu(out)
         return out
 
 
-def build_encode_layer(in_channel, out_channel):
-    pass
+def make_res_layer(in_channels, out_channels, stride):
+    layers = []
+    if stride != 1 or in_channels != out_channels:
+        layers.append(conv3x3(in_channels, out_channels, stride))
+        layers.append(nn.BatchNorm2d(out_channels))
+    layers.append(ResBlock2(out_channels, out_channels))
+    layers.append(ResBlock2(out_channels, out_channels))
+    return nn.Sequential(*layers)
 
 
-class EncoderBottom(nn.Module):
+def make_transpose_res_layer(in_channels, out_channels):
+    layers = [ResBlock2(in_channels, in_channels), ResBlock2(in_channels, in_channels),
+              transconv2x2(in_channels, out_channels), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)]
+    return nn.Sequential(*layers)
+
+
+class Encoder2(nn.Module):
     def __init__(self):
         super().__init__()
-        self.inplanes = 64
-        blocks = [
-            nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(self.inplanes),
-            nn.ReLU(inplace=True),
-            ResBlock2(self.inplanes, self.inplanes),
-            ResBlock2(self.inplanes, self.inplanes),
-            nn.Conv2d(self.inplanes, self.inplanes * 2, 3, stride=2, padding=1),
-            nn.BatchNorm2d(self.inplanes),
-            nn.ReLU(inplace=True),
-            ResBlock2(self.inplanes * 2, self.inplanes * 2),
-            ResBlock2(self.inplanes * 2, self.inplanes * 2),
-            nn.Conv2d(self.inplanes * 2, self.inplanes * 4, 3, stride=2, padding=1),
-            nn.BatchNorm2d(self.inplanes * 4),
-            nn.ReLU(inplace=True),
-            ResBlock2(self.inplanes * 4, self.inplanes * 4),
-            ResBlock2(self.inplanes * 4, self.inplanes * 4),
-            nn.Conv2d(self.inplanes * 4, self.inplanes * 8, 3, stride=2, padding=1),
-            nn.BatchNorm2d(self.inplanes * 8),
-            nn.ReLU(inplace=True),
-        ]
-        self.blocks = nn.Sequential(*blocks)
+        cur_channels = 64
+        self.conv1 = nn.Conv2d(3, cur_channels, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm2d(cur_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = make_res_layer(cur_channels, 64, 1)
+        self.layer2 = make_res_layer(cur_channels, 128, 2)
+        cur_channels = 128
+        self.layer3 = make_res_layer(cur_channels, 256, 2)
+        cur_channels = 256
+        self.layer4 = make_res_layer(cur_channels, 512, 2)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.maxpool(out)
+
+        out = self.layer1(out)
+        out = self.layer2(out)
+        bottom = self.layer3(out)
+        top = self.layer4(bottom)
+
+        return bottom, top
+
+
+class Decoder2Top(nn.Module):
+    def __init__(self, embed_dim):
+        super(Decoder2Top, self).__init__()
+        self.conv1 = nn.Conv2d(embed_dim, 512, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(512)
+        self.layer1 = make_transpose_res_layer(512, 256)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.layer1(out)
+        return out
+
+
+class Decoder2Bottom(nn.Module):
+    def __init__(self, embed_dim):
+        super(Decoder2Bottom, self).__init__()
+        cur_channels = 256
+        self.conv1 = nn.Conv2d(embed_dim, cur_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(cur_channels)
+        self.layer1 = make_transpose_res_layer(cur_channels, cur_channels // 2)
+        cur_channels //= 2
+        self.layer2 = make_transpose_res_layer(cur_channels, cur_channels // 2)
+        cur_channels //= 2
+        self.layer3 = make_transpose_res_layer(cur_channels, cur_channels)
+        self.layer4 = make_transpose_res_layer(cur_channels, cur_channels)
+        self.out_layer = conv1x1(cur_channels, 3, 1)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = self.out_layer(out)
+        return out
+
+
+class VqVae2(nn.Module):
+    def __init__(self, config: VqVaeConfig2):
+        super(VqVae2, self).__init__()
+
+        self.config = config
+        self.enc_top_channels = 512
+        self.enc_bottom_channels = 256
+
+        self.enc = Encoder2()
+        self.quantize_conv_t = nn.Conv2d(self.enc_top_channels, config.top_embed_dim, 1)
+        self.quantize_t = Quantize(config.top_embed_dim, config.top_n_embed)
+        self.dec_t = Decoder2Top(config.top_embed_dim)
+
+        self.quantize_conv_b = nn.Conv2d(self.enc_bottom_channels * 2, config.bottom_embed_dim, 1)
+        self.quantize_b = Quantize(config.bottom_embed_dim, config.bottom_n_embed)
+        self.upsample_t = transconv2x2(config.top_embed_dim, config.top_embed_dim)
+        self.dec_b = Decoder2Bottom(config.bottom_embed_dim + config.top_embed_dim)
+
+    def encode(self, input):
+        enc_b, enc_t = self.enc(input)
+        #print(1, "enc_b", enc_b.shape, "enc_t", enc_t.shape)
+
+        quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1)
+        #print(2, "quant_t", quant_t.shape)
+        quant_t, diff_t, id_t = self.quantize_t(quant_t)
+        #print(3, "quant_t", quant_t.shape, "diff_t", diff_t.shape, "id_t", id_t.shape)
+        quant_t = quant_t.permute(0, 3, 1, 2)
+        diff_t = diff_t.unsqueeze(0)
+
+        #print(4, "quant_t", quant_t.shape, "diff_t", diff_t.shape, "id_t", id_t.shape)
+        dec_t = self.dec_t(quant_t)
+        #print("4-1", "dec_t", dec_t.shape)
+        enc_b = torch.cat([dec_t, enc_b], 1)
+        #print(5, "dec_t", dec_t.shape, "enc_b", enc_b.shape)
+
+        quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1)
+        #print(6, "quant_b", quant_b.shape)
+        quant_b, diff_b, id_b = self.quantize_b(quant_b)
+        #print(7, "quant_b", quant_b.shape, "diff_b", diff_b.shape, "id_b", id_b.shape)
+        quant_b = quant_b.permute(0, 3, 1, 2)
+        diff_b = diff_b.unsqueeze(0)
+        #print(8, "quant_b", quant_b.shape, "diff_b", diff_b.shape, "id_b", id_b.shape)
+
+        return quant_t, quant_b, diff_t + diff_b, id_t, id_b
+
+    def decode(self, quant_t, quant_b):
+        quant_t = self.upsample_t(quant_t)
+        quant = torch.cat([quant_t, quant_b], 1)
+        dec = self.dec_b(quant)
+        #print(10, "dec", dec.shape)
+        return dec
 
     def forward(self, input):
-        return self.blocks(input)
-    
+        quant_t, quant_b, diff, id_t, id_b = self.encode(input)
+        #print(9, "quant_t", quant_t.shape, "quant_b", quant_b.shape, "diff", diff, "id_t", id_t.shape, "id_b", id_b.shape)
+        dec = self.decode(quant_t, quant_b)
 
-class EncoderTop(nn.Module):
-    def __init__(self):
-        super(EncoderTop, self).__init__()
-
+        return dec, diff, id_t, id_b
 

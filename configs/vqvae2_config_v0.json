@@ -1,0 +1,6 @@
+{
+  "bottom_embed_dim": 64,
+  "bottom_n_embed": 1024,
+  "top_embed_dim": 64,
+  "top_n_embed": 256
+}
