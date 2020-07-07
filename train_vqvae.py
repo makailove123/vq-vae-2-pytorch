@@ -29,8 +29,9 @@ from tqdm import tqdm
 from scheduler import CycleScheduler
 import distributed as dist
 
-from vqvae import VQVAE
-from vqvae_config import VqvaeConfig
+from vqvae import VQVAE, VqVae2
+from vqvae_config import VqvaeConfig, VqVaeConfig2
+from dataset_lmdb import ImageLmdbDataset
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +266,6 @@ class ImageDataset(IterableDataset):
         return self.num_examples
 
     def __iter__(self):
-        self.rand.shuffle(self.img_keys_file_list)
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             num_workers = worker_info.num_workers
@@ -274,7 +274,9 @@ class ImageDataset(IterableDataset):
             num_workers = 1
             worker_id = 0
         pic_size = int(math.ceil(len(self.img_keys_file_list) / num_workers))
-        for f in self.img_keys_file_list[pic_size * worker_id: pic_size * worker_id + pic_size]:
+        file_list = self.img_keys_file_list[pic_size * worker_id: pic_size * worker_id + pic_size]
+        self.rand.shuffle(file_list)
+        for f in file_list:
             for line in open(f):
                 img_key = line.strip()
                 img_path = get_key_path(self.img_root_path, img_key)
@@ -306,6 +308,7 @@ def main(args):
     model_config_json = open(args.config_path).read()
     print("ModelConfig:", model_config_json, file=sys.stderr, flush=True)
     model_config = VqvaeConfig.from_json(model_config_json)
+    #model_config = VqVaeConfig2.from_json(model_config_json)
 
     args.distributed = dist.get_world_size() > 1
     if args.device == "cpu":
@@ -314,12 +317,13 @@ def main(args):
         if args.distributed:
             device = torch.device("cuda", dist.get_local_rank())
             torch.cuda.set_device(device)
+            print("dist: {} {}".format(dist.get_local_rank(), dist.get_rank()), device, file=sys.stderr, flush=True)
         else:
             device = torch.device("cuda")
 
     transform = build_transform(args.size)
 
-    dataset = ImageDataset(args.img_root_path, args.img_keys_path, transform, args.batch_size, args.distributed,
+    dataset = ImageLmdbDataset(args.img_root_path, args.img_keys_path, transform, args.batch_size, args.distributed,
                            int(time.time()))
     local_batch_size = args.batch_size
     if args.distributed:
@@ -330,6 +334,7 @@ def main(args):
     )
 
     model = VQVAE(model_config).to(device)
+    #model = VqVae2(model_config).to(device)
 
     trained_steps, recent_ckpt = find_recent_checkpoint(args.output_path)
     if recent_ckpt is not None:
@@ -350,8 +355,9 @@ def main(args):
         '''
         scheduler = optim.lr_scheduler.CyclicLR(
             optimizer=optimizer,
-            base_lr=args.lr / 10,
+            base_lr=args.min_lr,
             max_lr=args.lr,
+            step_size_up=args.cycle_step,
             cycle_momentum=False
         )
     if recent_ckpt is not None:
@@ -360,7 +366,9 @@ def main(args):
                 torch.load(os.path.join(recent_ckpt, OPTIMIZER_SAVE_NAME), map_location=device)
             )
         if os.path.isfile(os.path.join(recent_ckpt, SCHEDULER_SAVE_NAME)):
-            scheduler.load_state_dict(torch.load(os.path.join(recent_ckpt, SCHEDULER_SAVE_NAME)))
+            scheduler.load_state_dict(
+                torch.load(os.path.join(recent_ckpt, SCHEDULER_SAVE_NAME), map_location=device)
+            )
 
     if args.fp16:
         if not is_apex_available():
@@ -425,6 +433,8 @@ if __name__ == "__main__":
     parser.add_argument("--fp16_opt_level", type=str, default="01")
     parser.add_argument("--img_keys_path", type=str, default=None)
     parser.add_argument("--img_root_path", type=str, default=None)
+    parser.add_argument("--min_lr", type=float, default=1e-5)
+    parser.add_argument("--cycle_step", type=int, default=2000)
 
     args = parser.parse_args()
 
