@@ -24,3 +24,16 @@ class VqvaeConfig:
         return cls(**json.loads(json_str))
 
 
+@dataclass
+class VqVaeConfig2:
+    bottom_embed_dim: int = 64
+    bottom_n_embed: int = 1024
+    top_embed_dim: int = 64
+    top_n_embed: int = 256
+
+    def to_json(self):
+        return json.dumps(dataclasses.asdict(self))
+
+    @classmethod
+    def from_json(cls, json_str: str):
+        return cls(**json.loads(json_str))
