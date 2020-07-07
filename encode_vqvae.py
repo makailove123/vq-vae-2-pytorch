@@ -7,6 +7,7 @@ from torch import multiprocessing as mp
 from torch.multiprocessing import Process
 import math
 import lmdb
+import time
 try:
      mp.set_start_method('spawn')
 except RuntimeError:
@@ -19,6 +20,7 @@ from train_vqvae import build_transform, get_key_path
 from vqvae import VQVAE
 from vqvae_config import VqvaeConfig
 from train_vqvae import ImageDataset, IterDataLoader
+from dataset_lmdb import ImageLmdbDataset
 
 
 def encode_proc(
@@ -86,7 +88,7 @@ def encode(args):
         model = torch.nn.DataParallel(model)
     model.eval()
     trans = build_transform(args.img_size)
-    dataset = ImageDataset(
+    dataset = ImageLmdbDataset(
         args.img_root_path, args.img_key_path, trans, args.batch_size, with_key=True
     )
     dataloader = IterDataLoader(
@@ -98,20 +100,52 @@ def encode(args):
     )
     lmdb_env = lmdb.open(args.output_path, map_size=int(1e12))
     lmdb_txn = lmdb_env.begin(write=True)
-    commit_cache = 0
+    cache = []
     batch_cnt = 0
+    input_cost = 0.0
+    to_cost = 0.0
+    eval_cost = 0.0
+    trans_cost = 0.0
+    write_cost = 0.0
+    write_batch_cnt = 0
+    t_point = time.time()
+    start_point = t_point
     for key_list, img_batch in dataloader:
-        id_t_batch = model(img_batch)[2].detach().cpu().flatten(1)
-        for key, id_t in zip(key_list, id_t_batch):
+        t_point_1 = time.time()
+        input_cost += t_point_1 - t_point
+        t_point = t_point_1
+        img_batch.to(device)
+        t_point_1 = time.time()
+        to_cost += t_point_1 - t_point
+        t_point = t_point_1
+        id_batch = model(img_batch)[3].detach().cpu().flatten(1)
+        t_point_1 = time.time()
+        eval_cost += t_point_1 - t_point
+        t_point = t_point_1
+        for key, id_t in zip(key_list, id_batch):
             lmdb_txn.put(key.encode("utf-8"), id_t.to(torch.int16).numpy().tobytes())
-        commit_cache += id_t_batch.shape[0]
-        if commit_cache > 1000:
+        t_point_1 = time.time()
+        trans_cost += t_point_1 - t_point
+        t_point = t_point_1
+        '''
+        if len(cache) > 1000:
+            for k, v in cache:
+                lmdb_txn.put(k, v)
             lmdb_txn.commit()
             lmdb_txn = lmdb_env.begin(write=True)
-            commit_cache = 0
+            del cache[:]
+            t_point_1 = time.time()
+            write_cost += t_point_1 - t_point
+            t_point = t_point_1
+            write_batch_cnt = batch_cnt
+        '''
         batch_cnt += 1
         if batch_cnt % 100 == 0:
-            print("{} batch done".format(batch_cnt), file=sys.stderr, flush=True)
+            print("{} batch done, input_c={:.4f}, to_c={:.4f}, eval_c={:.4f}, trans_c={:.4f}, total_c={:.4f}".format(
+                batch_cnt, input_cost / batch_cnt, to_cost / batch_cnt, eval_cost / batch_cnt, trans_cost / batch_cnt,
+                (time.time() - start_point) / batch_cnt
+            ), file=sys.stderr, flush=True)
+        t_point = time.time()
     lmdb_txn.commit()
     lmdb_env.close()
 
@@ -171,23 +205,17 @@ def main():
 if __name__ == "__main__":
     main()
     exit(0)
-    #config_path = "output_full_v2/ckpt/checkpoint-206000/config.json"
-    #model_path = "output_full_v2/ckpt/checkpoint-206000/pytorch_model.bin"
-    #config_path = "output_base/ckpt/checkpoint-217000/config.json"
-    #model_path = "output_base/ckpt/checkpoint-217000/pytorch_model.bin"
-    config_path = "output_full_base_cycle/ckpt/checkpoint-60000/config.json"
-    model_path = "output_full_base_cycle/ckpt/checkpoint-60000/pytorch_model.bin"
+    config_path = os.path.join(sys.argv[1], "config.json")
+    model_path = os.path.join(sys.argv[1], "pytorch_model.bin")
     model = VQVAE(VqvaeConfig.from_json(
         open(config_path).read())).to("cpu")
     model.load_state_dict(
         torch.load(model_path, map_location="cpu")
     )
     model.eval()
-    img_path = get_key_path("/mnt2/makai/imgs", "img/ochvq0GGSkRVPRjCvf1edchz50MM1585628833055_1.jpg")
+    img_path = get_key_path("/mnt2/makai/imgs", sys.argv[2])
     trans = build_transform(224)
     img = default_loader(img_path)
     img = trans(img)[None]
-    print(img)
     id_t, id_b = model(img)[2:4]
-    print(id_t)
-    print(id_b)
+    print(",".join((str(x.item()) for x in id_b.flatten(1)[0])))
